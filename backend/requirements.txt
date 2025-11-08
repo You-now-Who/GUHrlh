@@ -4,4 +4,5 @@ httpx==0.25.2
 python-dotenv==1.0.0
 lyricsgenius==3.0.1
 beautifulsoup4==4.12.2
+requests==2.32.5
 

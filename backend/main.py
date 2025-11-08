@@ -4,12 +4,14 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import httpx
 import os
-from typing import Optional
+from typing import Optional, List
 import secrets
 from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import lyricsgenius
+from translation_library import DeepLTranslator, LyricFormatter
+from translation_library.exceptions import TranslationError, RateLimitError, InvalidLanguageError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,9 +35,15 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8000/
 # Genius API access token for lyrics
 GENIUS_ACCESS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN", "")
 
+# DeepL API key for translation
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
+
 # Initialize Genius client (will be created lazily)
 genius_client = None
 executor = ThreadPoolExecutor(max_workers=2)
+
+# Initialize DeepL translator (will be created lazily)
+translator = None
 
 # In-memory storage for access tokens (use Redis or database in production)
 user_tokens = {}
@@ -58,10 +66,63 @@ class CurrentlyPlaying(BaseModel):
     duration_ms: int
 
 
+class LyricsLine(BaseModel):
+    text: str
+    timestamp_ms: int  # Timestamp in milliseconds
+
+
 class LyricsResponse(BaseModel):
     lyrics: str
     track_name: str
     artist_name: str
+    synced: bool = False  # Whether lyrics have timestamps
+    lines: Optional[List[LyricsLine]] = None  # Timestamped lines if synced
+
+
+class TranslationRequest(BaseModel):
+    lyrics: str
+    target_lang: str = 'FR'
+    source_lang: Optional[str] = 'EN'
+
+
+class TranslationResponse(BaseModel):
+    translated_lyrics: str
+    original_lyrics: str
+    target_language: str
+    detected_language: Optional[str] = None
+    translated_lines: Optional[List[LyricsLine]] = None  # For synced lyrics
+
+
+class OverlayLine(BaseModel):
+    original: str
+    translated: str
+    timestamp_ms: Optional[int] = None  # For synced lyrics
+
+
+class OverlayTranslationRequest(BaseModel):
+    lyrics: str
+    target_lang: str = 'FR'
+    source_lang: Optional[str] = 'EN'
+    lines: Optional[List[LyricsLine]] = None  # For synced lyrics
+
+
+class OverlayTranslationResponse(BaseModel):
+    lines: List[OverlayLine]
+    target_language: str
+    detected_language: Optional[str] = None
+
+
+class WordTranslationRequest(BaseModel):
+    word: str
+    target_lang: str = 'FR'
+    source_lang: Optional[str] = 'EN'
+
+
+class WordTranslationResponse(BaseModel):
+    original_word: str
+    translated_word: str
+    target_language: str
+    detected_language: Optional[str] = None
 
 
 @app.get("/")
@@ -287,6 +348,427 @@ async def get_lyrics(track_name: str, artist_name: str):
         synced=False,
     )
 
+def __translate_lyrics_sync(text: str, target_lang: str, source_lang: Optional[str] = None) -> dict:
+    """Synchronous wrapper for translation"""
+    global translator
+    if translator is None:
+        translator = DeepLTranslator(api_key=DEEPL_API_KEY, use_cache=False)
+    return translator.translate_lyrics(
+        text=text,
+        target_lang=target_lang,
+        source_lang=source_lang,
+        preserve_formatting=True,
+        formality='prefer_less'
+    )
+
+
+@app.post("/translate", response_model=TranslationResponse)
+async def translate_lyrics(request: TranslationRequest):
+    """Translate lyrics to a target language"""
+    global translator
+    
+    if not DEEPL_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="DeepL API key not configured. Set DEEPL_API_KEY environment variable."
+        )
+    
+    # Initialize translator if not already done
+    if translator is None:
+        try:
+            translator = DeepLTranslator(api_key=DEEPL_API_KEY, use_cache=False)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to initialize translator: {str(e)}"
+            )
+    
+    try:
+        # If we have synced lyrics (lines), translate each line separately
+        print("Trying plane text yay :D")
+        # Translate plain text lyrics - use formatter like in example
+        formatter = LyricFormatter()
+        
+        # Preprocess lyrics for better translation
+        formatted_lyrics = formatter.preprocess_lyrics(request.lyrics)
+        
+        # Split into segments if too long
+        segments = formatter.split_into_segments(formatted_lyrics, max_segment_length=1000)
+        
+        # Translate each segment using batch translation
+        translations = []
+        detected_lang = None
+        
+        for segment in segments:
+            result = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                __translate_lyrics_sync,
+                segment,
+                request.target_lang,
+                request.source_lang
+            )
+            translations.append(result)
+            if not detected_lang:
+                detected_lang = result.get('detected_language')
+        
+        # Reassemble translated segments
+        translated_lyrics = formatter.reassemble_segments(translations)
+        
+        return TranslationResponse(
+            translated_lyrics=translated_lyrics,
+            original_lyrics=request.lyrics,
+            target_language=request.target_lang,
+            detected_language=detected_lang
+        )
+    
+    except InvalidLanguageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RateLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+    except TranslationError as e:
+        raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+def __translate_batch_sync(texts: List[str], target_lang: str, source_lang: Optional[str] = None) -> List[dict]:
+    """Synchronous wrapper for batch translation - translates multiple texts in one API call"""
+    global translator
+    if translator is None:
+        translator = DeepLTranslator(api_key=DEEPL_API_KEY, use_cache=False)
+    
+    # Use DeepL's batch translation by sending multiple texts in one request
+    # DeepL API supports multiple 'text' parameters
+    import requests
+    
+    params = {
+        'target_lang': target_lang.upper(),
+        'preserve_formatting': '1',
+        'formality': 'prefer_less'
+    }
+    
+    if source_lang:
+        params['source_lang'] = source_lang.upper()
+    
+    # Add all texts as separate 'text' parameters
+    for text in texts:
+        params.setdefault('text', []).append(text)
+    
+    headers = {
+        'Authorization': f'DeepL-Auth-Key {translator.api_key}',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    
+    try:
+        # DeepL API expects multiple 'text' parameters, but requests library needs special handling
+        # We'll use a list of tuples for the data parameter
+        data = []
+        for key, value in params.items():
+            if key == 'text':
+                for text in value:
+                    data.append(('text', text))
+            else:
+                data.append((key, value))
+        
+        response = requests.post(
+            translator.base_url,
+            data=data,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 429:
+            raise RateLimitError("DeepL API rate limit exceeded")
+        elif response.status_code != 200:
+            raise TranslationError(f"DeepL API error: {response.status_code} - {response.text}")
+        
+        data_response = response.json()
+        translations = data_response['translations']
+        
+        results = []
+        for i, translation in enumerate(translations):
+            results.append({
+                'original_text': texts[i],
+                'translated_text': translation['text'],
+                'detected_language': translation.get('detected_source_language'),
+                'target_language': target_lang
+            })
+        
+        return results
+        
+    except requests.exceptions.RequestException as e:
+        raise TranslationError(f"Network error: {str(e)}")
+
+
+@app.post("/translate-lines", response_model=OverlayTranslationResponse)
+async def translate_lines_overlay(request: OverlayTranslationRequest):
+    """Translate lyrics line-by-line for overlay display (shows both original and translated)"""
+    global translator
+    
+    if not DEEPL_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="DeepL API key not configured. Set DEEPL_API_KEY environment variable."
+        )
+    
+    # Initialize translator if not already done
+    if translator is None:
+        try:
+            translator = DeepLTranslator(api_key=DEEPL_API_KEY, use_cache=False)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to initialize translator: {str(e)}"
+            )
+    
+    try:
+        overlay_lines = []
+        detected_lang = None
+        
+        # Batch size for translation (to avoid rate limits)
+        BATCH_SIZE = 20  # Translate 20 lines at a time
+        
+        # If we have synced lyrics (lines), translate in batches
+        if request.lines:
+            # Create a list to store results in order
+            overlay_lines = [None] * len(request.lines)
+            lines_to_translate = []
+            translate_indices = []  # Track which indices need translation
+            
+            for idx, line in enumerate(request.lines):
+                if line.text.strip():  # Only translate non-empty lines
+                    lines_to_translate.append(line.text)
+                    translate_indices.append(idx)
+                else:
+                    # Empty line - set directly
+                    overlay_lines[idx] = OverlayLine(
+                        original="",
+                        translated="",
+                        timestamp_ms=line.timestamp_ms
+                    )
+            
+            # Translate in batches
+            for i in range(0, len(lines_to_translate), BATCH_SIZE):
+                batch = lines_to_translate[i:i + BATCH_SIZE]
+                batch_indices = translate_indices[i:i + BATCH_SIZE]
+                
+                # Add small delay between batches to avoid rate limits (except for first batch)
+                if i > 0:
+                    await asyncio.sleep(0.5)  # 500ms delay between batches
+                
+                try:
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        __translate_batch_sync,
+                        batch,
+                        request.target_lang,
+                        request.source_lang
+                    )
+                    
+                    for result, idx in zip(results, batch_indices):
+                        line = request.lines[idx]
+                        overlay_lines[idx] = OverlayLine(
+                            original=line.text,
+                            translated=result['translated_text'],
+                            timestamp_ms=line.timestamp_ms
+                        )
+                        if not detected_lang:
+                            detected_lang = result.get('detected_language')
+                except Exception as e:
+                    # If batch translation fails, fall back to individual translations
+                    print(f"Error translating batch: {e}, falling back to individual")
+                    for text, idx in zip(batch, batch_indices):
+                        line = request.lines[idx]
+                        try:
+                            result = await asyncio.get_event_loop().run_in_executor(
+                                executor,
+                                __translate_lyrics_sync,
+                                text,
+                                request.target_lang,
+                                request.source_lang
+                            )
+                            overlay_lines[idx] = OverlayLine(
+                                original=line.text,
+                                translated=result['translated_text'],
+                                timestamp_ms=line.timestamp_ms
+                            )
+                        except Exception as e2:
+                            print(f"Error translating line: {e2}")
+                            overlay_lines[idx] = OverlayLine(
+                                original=line.text,
+                                translated=line.text,
+                                timestamp_ms=line.timestamp_ms
+                            )
+        else:
+            # Split plain text lyrics into lines
+            original_lines = request.lyrics.split('\n')
+            overlay_lines = [None] * len(original_lines)
+            lines_to_translate = []
+            translate_indices = []
+            
+            for idx, original_line in enumerate(original_lines):
+                original_line = original_line.strip()
+                if not original_line:  # Empty line
+                    overlay_lines[idx] = OverlayLine(
+                        original="",
+                        translated=""
+                    )
+                else:
+                    lines_to_translate.append(original_line)
+                    translate_indices.append(idx)
+            
+            # Translate in batches
+            for i in range(0, len(lines_to_translate), BATCH_SIZE):
+                batch = lines_to_translate[i:i + BATCH_SIZE]
+                batch_indices = translate_indices[i:i + BATCH_SIZE]
+                
+                # Add small delay between batches to avoid rate limits (except for first batch)
+                if i > 0:
+                    await asyncio.sleep(0.5)  # 500ms delay between batches
+                
+                try:
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        __translate_batch_sync,
+                        batch,
+                        request.target_lang,
+                        request.source_lang
+                    )
+                    
+                    for result, idx in zip(results, batch_indices):
+                        overlay_lines[idx] = OverlayLine(
+                            original=result['original_text'],
+                            translated=result['translated_text']
+                        )
+                        if not detected_lang:
+                            detected_lang = result.get('detected_language')
+                except Exception as e:
+                    # If batch translation fails, fall back to individual
+                    print(f"Error translating batch: {e}, falling back to individual")
+                    for text, idx in zip(batch, batch_indices):
+                        try:
+                            result = await asyncio.get_event_loop().run_in_executor(
+                                executor,
+                                __translate_lyrics_sync,
+                                text,
+                                request.target_lang,
+                                request.source_lang
+                            )
+                            overlay_lines[idx] = OverlayLine(
+                                original=result['original_text'],
+                                translated=result['translated_text']
+                            )
+                        except Exception as e2:
+                            print(f"Error translating line: {e2}")
+                            overlay_lines[idx] = OverlayLine(
+                                original=text,
+                                translated=text
+                            )
+        
+        return OverlayTranslationResponse(
+            lines=overlay_lines,
+            target_language=request.target_lang,
+            detected_language=detected_lang
+        )
+    
+    except InvalidLanguageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RateLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+    except TranslationError as e:
+        raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@app.post("/translate-word", response_model=WordTranslationResponse)
+async def translate_word(request: WordTranslationRequest):
+    """Translate a single word to the target language"""
+    global translator
+    
+    if not DEEPL_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="DeepL API key not configured. Set DEEPL_API_KEY environment variable."
+        )
+    
+    # Initialize translator if not already done
+    if translator is None:
+        try:
+            translator = DeepLTranslator(api_key=DEEPL_API_KEY, use_cache=False)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to initialize translator: {str(e)}"
+            )
+    
+    try:
+        # Clean the word (remove punctuation for better translation)
+        import re
+        clean_word = re.sub(r'[^\w\s]', '', request.word).strip()
+        
+        if not clean_word:
+            # If word is just punctuation, return as-is
+            return WordTranslationResponse(
+                original_word=request.word,
+                translated_word=request.word,
+                target_language=request.target_lang
+            )
+        
+        result = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            __translate_lyrics_sync,
+            clean_word,
+            request.target_lang,
+            request.source_lang
+        )
+        
+        return WordTranslationResponse(
+            original_word=request.word,
+            translated_word=result['translated_text'],
+            target_language=request.target_lang,
+            detected_language=result.get('detected_language')
+        )
+    
+    except InvalidLanguageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RateLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+    except TranslationError as e:
+        raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@app.get("/languages")
+async def get_supported_languages():
+    """Get list of supported languages for translation"""
+    # Languages are hardcoded in the DeepLTranslator class, so we can access them directly
+    try:
+        languages = [
+            {'code': code, 'name': name}
+            for code, name in sorted(DeepLTranslator.SUPPORTED_LANGUAGES.items())
+        ]
+        return {"languages": languages}
+    except Exception as e:
+        # Final fallback
+        languages = [
+            {'code': 'EN', 'name': 'English'},
+            {'code': 'ES', 'name': 'Spanish'},
+            {'code': 'FR', 'name': 'French'},
+            {'code': 'DE', 'name': 'German'},
+            {'code': 'IT', 'name': 'Italian'},
+            {'code': 'PT', 'name': 'Portuguese'},
+            {'code': 'JA', 'name': 'Japanese'},
+            {'code': 'KO', 'name': 'Korean'},
+            {'code': 'ZH', 'name': 'Chinese'},
+        ]
+        return {"languages": languages}
+
 
 def __get_genius_lyrics_sync(track_name: str, artist_name: str) -> Optional[str]:
     """Synchronous function to get lyrics from Genius API using lyricsgenius"""
@@ -343,6 +825,75 @@ async def __get_genius_lyrics(track_name: str, artist_name: str) -> Optional[str
     except Exception as e:
         print(f"Error in async Genius lyrics fetch: {e}")
         return None
+
+
+def __parse_lrc_content(lrc_content: str) -> Optional[dict]:
+    """Parse LRC file content and extract timestamped lines"""
+    try:
+        lines = []
+        full_text = []
+        import re
+        
+        for line in lrc_content.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Parse timestamp format: [mm:ss.xx] or [mm:ss.xxx]
+            timestamp_match = re.match(r'\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)', line)
+            if timestamp_match:
+                minutes = int(timestamp_match.group(1))
+                seconds = int(timestamp_match.group(2))
+                centiseconds = int(timestamp_match.group(3))
+                
+                # Convert to milliseconds
+                timestamp_ms = (minutes * 60 + seconds) * 1000 + (centiseconds * 10 if len(timestamp_match.group(3)) == 2 else centiseconds)
+                
+                text = timestamp_match.group(4).strip()
+                if text:  # Only add non-empty lines
+                    lines.append(LyricsLine(text=text, timestamp_ms=timestamp_ms))
+                    full_text.append(text)
+        
+        if lines:
+            return {
+                "lines": lines,
+                "text": "\n".join(full_text)
+            }
+        
+        return None
+    except Exception as e:
+        print(f"Error parsing LRC: {e}")
+        return None
+
+
+async def __get_lrc_lyrics(track_name: str, artist_name: str) -> Optional[dict]:
+    """Try to fetch LRC file from various sources"""
+    # Clean up names for URL encoding
+    artist = artist_name.split(",")[0].strip()
+    
+    async with httpx.AsyncClient() as client:
+        # Try LRCLib API first (free, open source)
+        try:
+            from urllib.parse import quote
+            encoded_artist = quote(artist)
+            encoded_track = quote(track_name)
+            url = f"https://lrclib.net/api/get?artist_name={encoded_artist}&track_name={encoded_track}"
+            
+            response = await client.get(url, timeout=5.0, follow_redirects=True)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("syncedLyrics"):
+                    # LRCLib returns synced lyrics in LRC format
+                    lrc_content = data.get("syncedLyrics", "")
+                    parsed = __parse_lrc_content(lrc_content)
+                    if parsed:
+                        print(f"[DEBUG] Found LRC lyrics from LRCLib for {track_name} by {artist}")
+                        return parsed
+        except Exception as e:
+            print(f"LRCLib API error: {e}")
+    
+    return None
 
 
 async def __get_lyrics_ovh(track_name: str, artist_name: str) -> Optional[str]:
